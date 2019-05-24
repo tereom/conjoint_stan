@@ -1,0 +1,55 @@
+---
+title: "CBC"
+author: "Teresa Ortiz"
+date: "5/24/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readr)
+```
+
+
+```{r}
+cbc_df <- read_csv("http://goo.gl/5xQObB", col_types = "iiifffffi")
+glimpse(cbc_df)
+
+cbc_df <- cbc_df %>% 
+    mutate_if(is.factor, as.integer)
+
+# we use sawtooth's defult and choice repeats constant in task
+cbc_saw <- cbc_df %>% 
+    group_by(resp.id, ques) %>% 
+    mutate(choice = choice %*% alt) %>% 
+    ungroup()
+glimpse(cbc_saw)
+
+# stan needs number of options in each variable (passed as list)
+n_vars <- cbc_saw %>% 
+    summarise_each(max) %>% 
+    map(~.)
+names(n_vars) <- str_c("n_", names(n_vars))
+
+# index matrix for iterations
+index <- array(0, dim = c(n_vars$n_resp.id, n_vars$n_ques, n_vars$n_alt))
+
+r <- 1
+for(i in 1:n_vars$n_resp.id){
+    for(j in 1:n_vars$n_ques){
+        for(k in 1:n_vars$n_alt){
+            index[i, j, k] <- r
+            r <- r + 1
+        }
+    }
+}
+
+vars <- map(cbc_saw, ~.)
+params_stan <- c(N = N, n_vars, vars, list(index = index))
+
+
+
+```
+
