@@ -1,43 +1,75 @@
 ---
 title: "CBC"
-author: "Teresa Ortiz"
 date: "5/24/2019"
-output: html_document
+output: pdf_document
 ---
 
-```{r setup, include=FALSE}
+The objective of conjoint analysis is to measure how respondents trade-off 
+various alternatives and their respective attribute levels; for example, the trade-off a consumer faces is whether to buy a cheaper car with higher fuel consumption or a more expensive one with lower fuel consumption. Conjoint 
+analysis is a survey technique that asks respondents to evaluate products. These 
+product evaluations are then decomposed to derive estimates on the utilities of 
+the products constituent attribute levels (the part-worths). Conjoint analysis 
+is thus a decompositional approach.
+
+Researchers can estimate part-worths based on estimation techniques such as regression analysis (ratings-based data) or multinomial logistic regression 
+(choice data). The total value of an alternative can then be computed as the sum 
+of its respective part-worth utilities. Almost all published research on 
+conjoint analysis and preference measurement is based on the assumption of a 
+linear additive utility model.
+
+http://www.rpubs.com/angelayy/185881
+
+http://r-marketing.r-forge.r-project.org/Instructor/Chapter13/Chapter13-ChapmanFeit.html#/
+
+Data summary: there are 200 respondents conducted the survey. Each survey 
+includes 15 questions, each question has 3 options or 3 althernatives. There are 
+5 product features or attributes.
+
+```{r setup, message=FALSE, warning=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
 library(tidyverse)
 library(readr)
+library(rstan)
 ```
 
+Data preparation / Preparción de los datos
 
 ```{r}
-cbc_df <- read_csv("http://goo.gl/5xQObB", col_types = "iiifffffi")
+cbc_df <- read_csv("http://goo.gl/5xQObB", col_types = "iiiccccci")
 glimpse(cbc_df)
 
 cbc_df <- cbc_df %>% 
-    mutate_if(is.factor, as.integer)
+    mutate_if(is.character, list(int = ~as.integer(as.factor(.)))) %>% 
+    rename(resp_id = resp.id)
 
-# we use sawtooth's defult and choice repeats constant in task
+cbc_levels <- cbc_df %>% 
+    select(carpool:price) %>% 
+    map_df(~data_frame(label = levels(factor(.)), 
+        level = 1:n_distinct(label)), .id = "var")
+
+
+# using sawtooth's defult format where the choice values repeats along a task
 cbc_saw <- cbc_df %>% 
-    group_by(resp.id, ques) %>% 
+    group_by(resp_id, ques) %>% 
     mutate(choice = choice %*% alt) %>% 
-    ungroup()
+    ungroup() %>% 
+    select(resp_id:alt, choice, carpool_int:price_int)
 glimpse(cbc_saw)
 
-# stan needs number of options in each variable (passed as list)
+# Stan model recieves number of options in each variable (as list)
 n_vars <- cbc_saw %>% 
-    summarise_each(max) %>% 
+    summarise_if(is.numeric, max) %>% 
+    select(-choice) %>% 
     map(~.)
-names(n_vars) <- str_c("n_", names(n_vars))
+names_vars_n <- str_c("n_", str_remove(names(n_vars), "_int"))
+n_vars <- set_names(n_vars, names_vars_n)
 
 # index matrix for iterations
-index <- array(0, dim = c(n_vars$n_resp.id, n_vars$n_ques, n_vars$n_alt))
+index <- array(0, dim = c(n_vars$n_resp_id, n_vars$n_ques, n_vars$n_alt))
 
 r <- 1
-for(i in 1:n_vars$n_resp.id){
+for(i in 1:n_vars$n_resp_id){
     for(j in 1:n_vars$n_ques){
         for(k in 1:n_vars$n_alt){
             index[i, j, k] <- r
@@ -47,9 +79,84 @@ for(i in 1:n_vars$n_resp.id){
 }
 
 vars <- map(cbc_saw, ~.)
-params_stan <- c(N = N, n_vars, vars, list(index = index))
+params_stan <- c(N = nrow(cbc_saw), n_vars, vars, list(index = index))
+
+```
 
 
+## Modelo 1
+
+Modelo 
+
+The parameter estimates are on the logit scale and typically range between -2 to 
+2. With higher value, suggest strongly like (positive) or dislike (negative)
+
+```{r, eval = FALSE}
+fit_1 <- stan(file = "../stan_files/logistic-multinomial.stan", 
+  data = params_stan, iter = 500, chains = 2, cores = 3, thin = 5, 
+  verbose = FALSE, seed = 457, 
+    pars = c("b_cargo_c", "b_seat_c", "b_eng_c", "b_price_c"))
+
+write_rds(fit_1, path = "../data_output/model_fits/model_1.rds")
+```
+
+```{r, fig.height=3.5}
+fit_1 <- read_rds(path = "../data_output/model_fits/model_1.rds")
+
+get_summary_coef <- function(fit, data_levels = cbc_levels){
+    summary_fit <- summary(fit)$summary %>% 
+        as_tibble(rownames = "coef") %>% 
+        mutate(
+            var = str_extract(coef, pattern = "_([a-z]+)_|_([a-z]+)") %>%
+                str_remove_all("_"),
+            level = str_extract(coef, pattern = "[0-9]+(])$") %>% 
+                str_remove_all("]") %>% as.integer(), 
+            ind = str_extract(coef, pattern = "[0-9]+(,)") %>% 
+                str_remove_all(",") %>% as.integer()
+            ) %>%
+        filter(!is.na(var), !is.na(level)) %>% 
+        left_join(cbc_levels, by = c("var", "level")) 
+}
+
+summary_fit_plot <- get_summary_coef(fit_1, cbc_levels)
+
+ggplot(summary_fit_plot, aes(x = label, ymin = `25%`, ymax = `75%`)) +
+    geom_linerange(size = 1.5) +
+    facet_wrap(~var, scales = "free_x", nrow = 1)
+
+```
+
+
+### Adding consumer heterogenity
+
+
+```{r, eval=FALSE}
+fit_2 <- stan(file = "../stan_files/logistic-multinomial-hetero.stan", 
+  data = params_stan, iter = 500, chains = 2, cores = 3, thin = 5, 
+  verbose = FALSE, seed = 457, 
+    pars = c("mu_cargo_c", "mu_seat_c", "mu_eng_c", "mu_price_c", 
+        "b_cargo", "b_seat", "b_eng", "b_price"))
+
+write_rds(fit_2, path = "../data_output/model_fits/model_2.rds")
+```
+
+```{r, fig.height=3.5}
+fit_2 <- read_rds(path = "../data_output/model_fits/model_2.rds")
+
+summary_fit_plot <- get_summary_coef(fit_2, cbc_levels)
+
+summary_mus <- filter(summary_fit_plot, str_detect(coef, "mu"))
+ggplot(summary_mus, aes(x = label, ymin = `25%`, ymax = `75%`)) +
+    geom_linerange(size = 1.5) +
+    facet_wrap(~var, scales = "free_x", nrow = 1)
+
+summary_inds <- filter(summary_fit_plot, !str_detect(coef, "mu")) 
+ids_sample <- sample(1:200, 10)
+
+ggplot(filter(summary_inds, ind %in% ids_sample) , 
+    aes(x = label, y = mean, ymin = `25%`, ymax = `75%`)) +
+    geom_path(aes(color = factor(ind), group = ind), show.legend = FALSE) +
+    facet_wrap(~var, scales = "free_x", nrow = 1)
 
 ```
 
